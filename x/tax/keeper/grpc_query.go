@@ -1,0 +1,200 @@
+package keeper
+
+import (
+	"context"
+	"fmt"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
+	"github.com/cosmos/cosmos-sdk/store/prefix"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/query"
+
+	"github.com/tendermint/tax/x/tax/types"
+)
+
+// Querier is used as Keeper will have duplicate methods if used directly, and gRPC names take precedence over keeper.
+type Querier struct {
+	Keeper
+}
+
+var _ types.QueryServer = Querier{}
+
+func (k Querier) Params(c context.Context, _ *types.QueryParamsRequest) (*types.QueryParamsResponse, error) {
+	ctx := sdk.UnwrapSDKContext(c)
+	var params types.Params
+	k.paramSpace.GetParamSet(ctx, &params)
+	return &types.QueryParamsResponse{Params: params}, nil
+}
+
+func (k Querier) Taxes(c context.Context, req *types.QueryTaxesRequest) (*types.QueryTaxesResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid request")
+	}
+
+	if req.Type != "" && !(req.Type == types.PlanTypePublic.String() || req.Type == types.PlanTypePrivate.String()) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid plan type %s", req.Type)
+	}
+
+	if req.TaxPoolAddress != "" {
+		if _, err := sdk.AccAddressFromBech32(req.TaxPoolAddress); err != nil {
+			return nil, err
+		}
+	}
+
+	if req.RewardPoolAddress != "" {
+		if _, err := sdk.AccAddressFromBech32(req.RewardPoolAddress); err != nil {
+			return nil, err
+		}
+	}
+
+	if req.TerminationAddress != "" {
+		if _, err := sdk.AccAddressFromBech32(req.TerminationAddress); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := sdk.ValidateDenom(req.StakingCoinDenom); err != nil {
+		return nil, err
+	}
+
+	ctx := sdk.UnwrapSDKContext(c)
+	store := ctx.KVStore(k.storeKey)
+	planStore := prefix.NewStore(store, types.PlanKeyPrefix)
+
+	var taxes []*codectypes.Any
+	pageRes, err := query.FilteredPaginate(planStore, req.Pagination, func(key, value []byte, accumulate bool) (bool, error) {
+		plan, err := k.UnmarshalPlan(value)
+		if err != nil {
+			return false, err
+		}
+		any, err := codectypes.NewAnyWithValue(plan)
+		if err != nil {
+			return false, err
+		}
+
+		if req.TaxPoolAddress != "" && plan.GetTaxPoolAddress().String() != req.TaxPoolAddress {
+			return false, nil
+		}
+
+		if req.RewardPoolAddress != "" && plan.GetRewardPoolAddress().String() != req.RewardPoolAddress {
+			return false, nil
+		}
+
+		if req.TerminationAddress != "" && plan.GetTerminationAddress().String() != req.TerminationAddress {
+			return false, nil
+		}
+
+		if req.StakingCoinDenom != "" {
+			found := false
+			for _, coin := range plan.GetStakingCoinWeights() {
+				if coin.Denom == req.StakingCoinDenom {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false, nil
+			}
+		}
+
+		if accumulate {
+			taxes = append(taxes, any)
+		}
+
+		return true, nil
+	})
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &types.QueryTaxesResponse{Taxes: taxes, Pagination: pageRes}, nil
+}
+
+func (k Querier) Plan(c context.Context, req *types.QueryPlanRequest) (*types.QueryPlanResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid request")
+	}
+
+	ctx := sdk.UnwrapSDKContext(c)
+	plan, found := k.GetPlan(ctx, req.PlanId)
+	if !found {
+		return nil, status.Errorf(codes.NotFound, "plan %d not found", req.PlanId)
+	}
+
+	any, err := codectypes.NewAnyWithValue(plan)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &types.QueryPlanResponse{Plan: any}, nil
+}
+
+func (k Querier) Stakings(c context.Context, req *types.QueryStakingsRequest) (*types.QueryStakingsResponse, error) {
+	panic("not implemented")
+}
+
+func (k Querier) Rewards(c context.Context, req *types.QueryRewardsRequest) (*types.QueryRewardsResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid request")
+	}
+
+	ctx := sdk.UnwrapSDKContext(c)
+	store := ctx.KVStore(k.storeKey)
+
+	if req.Farmer != "" {
+		farmerAddr, err := sdk.AccAddressFromBech32(req.Farmer)
+		if err != nil {
+			return nil, err
+		}
+
+		var rewards []*types.Reward
+		indexStore := prefix.NewStore(store, types.GetRewardByFarmerAddrIndexPrefix(farmerAddr))
+		pageRes, err := query.FilteredPaginate(indexStore, req.Pagination, func(key, value []byte, accumulate bool) (bool, error) {
+			stakingCoinDenom := types.GetRewardStakingCoinDenomFromIndexKey(key)
+			if req.StakingCoinDenom != "" {
+				if stakingCoinDenom != req.StakingCoinDenom {
+					return false, nil
+				}
+			}
+			reward, found := k.GetReward(ctx, stakingCoinDenom, farmerAddr)
+			if !found { // TODO: remove this check
+				return false, fmt.Errorf("reward not found")
+			}
+			if accumulate {
+				rewards = append(rewards, &reward)
+			}
+			return true, nil
+		})
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+
+		return &types.QueryRewardsResponse{Rewards: rewards, Pagination: pageRes}, nil
+	}
+
+	var rewardPrefix []byte
+	if req.StakingCoinDenom != "" {
+		rewardPrefix = types.GetRewardByStakingCoinDenomPrefix(req.StakingCoinDenom)
+	} else {
+		rewardPrefix = types.RewardKeyPrefix
+	}
+	rewardStore := prefix.NewStore(store, rewardPrefix)
+
+	var rewards []*types.Reward
+	pageRes, err := query.Paginate(rewardStore, req.Pagination, func(key, value []byte) error {
+		reward, err := k.UnmarshalReward(value)
+		if err != nil {
+			return err
+		}
+		rewards = append(rewards, &reward)
+		return nil
+	})
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &types.QueryRewardsResponse{Rewards: rewards, Pagination: pageRes}, nil
+}
