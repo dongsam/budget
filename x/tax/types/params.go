@@ -1,6 +1,9 @@
 package types
 
 import (
+	"fmt"
+
+	sdk "github.com/cosmos/cosmos-sdk/types"
 	"gopkg.in/yaml.v2"
 
 	paramstypes "github.com/cosmos/cosmos-sdk/x/params/types"
@@ -54,6 +57,26 @@ func (p Params) Validate() error {
 }
 
 func validateTaxes(i interface{}) error {
+	fmt.Println("@@@@@@@ validateTaxes", i)
+	taxes, ok := i.([]Tax)
+	fmt.Println(taxes)
+	if !ok {
+		return fmt.Errorf("invalid parameter type: %T", i)
+	}
+
+	for _, tax := range taxes {
+		taxSourceAcc, err := sdk.AccAddressFromBech32(tax.TaxSourceAddress)
+		if err != nil {
+			return fmt.Errorf("invalid TaxSourceAddress type: %T", tax)
+		}
+		collectionAcc, err := sdk.AccAddressFromBech32(tax.CollectionAddress)
+		if err != nil {
+			return fmt.Errorf("invalid CollectionAddress type: %T", tax)
+		}
+		fmt.Println(taxSourceAcc, collectionAcc)
+	}
+	// TODO: check added, fixed, deleted
+
 	// TODO: unimplemented
 	return nil
 }
